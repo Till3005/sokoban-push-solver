@@ -15,7 +15,11 @@
 //   2. push-A*, weight 3 — same search, f = g + 3h: no optimality guarantee, but far cheaper and
 //      it finds a valid solution on the bigger multi-room levels.
 //   3. move-level A* (kit baseline port, plus the same deadlock pruning) — valid but wasteful.
-//   4. empty solution.txt as the last resort.
+//   4. room decomposition: cut the free space at articulation squares, merge components until
+//      each body has boxes == goals, push-solve every body on its own tiny grid, stitch the
+//      pieces with player walks. Runs only after everything above failed; this is what cracks
+//      the big multi-room levels.
+//   5. empty solution.txt as the last resort.
 // Every candidate solution is replay-checked internally before it is written.
 //
 // Levels with >= BIG_LEVEL_BOXES boxes try the cheap weighted pass first: the optimal pass is
@@ -32,6 +36,7 @@
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const IN = process.argv[2] ?? '/input';
 const OUT = process.argv[3] ?? '/output';
@@ -43,6 +48,10 @@ const PUSH_WEIGHT = 3;
 const GREEDY_EXPANSIONS = 100_000;
 const MOVE_EXPANSIONS = 150_000;
 const BIG_LEVEL_BOXES = 10;
+// Decomposition last-resort: per-body and total expansion budgets (deterministic counts).
+// Bodies seen so far solve in <= ~600 expansions; the caps bound pathological cases only.
+const DECOMP_BODY_CAP = 50_000;
+const DECOMP_TOTAL = 250_000;
 // Node-pool ceilings. Push search: worst observed need is i003's 968,140 commits at 250k
 // expansions (worst commits/expansion rate seen is ~16, so a pool of min(ceiling, cap*16+1024)
 // never truncates a search that its expansion budget would have finished). Move search: at most
@@ -58,7 +67,7 @@ const DY = [-1, 1, 0, 0];
 const CH = ['u', 'd', 'l', 'r'];
 const CHU = ['U', 'D', 'L', 'R'];
 
-type Level = {
+export type Level = {
   W: number;
   n: number;
   wall: Uint8Array;
@@ -72,7 +81,7 @@ type Level = {
   exact: Int32Array[]; // exact[goalIndex][box * n + region]: exact single-box push distance
 };
 
-function parse(text: string): Level {
+export function parse(text: string): Level {
   const rows = text.replace(/\r/g, '').split('\n').filter((r) => r.length > 0);
   const W = Math.max(...rows.map((r) => r.length));
   const H = rows.length;
@@ -311,7 +320,7 @@ type Flood = {
 type Outcome = { status: 'solved' | 'unsolvable' | 'budget'; moves: string; expansions: number };
 
 // A* over push states. weight 1 = push-optimal; higher weights trade optimality for speed.
-function pushSolve(lv: Level, cap: number, weight: number): Outcome {
+export function pushSolve(lv: Level, cap: number, weight: number): Outcome {
   const { W, n, wall, goal, goals, dead, minDist, regionOf, exact } = lv;
   const rootBoxes = lv.boxes.slice();
   const rootPlayer = lv.player;
@@ -989,8 +998,296 @@ function moveSolve(lv: Level, cap: number): Outcome {
   return { status: 'unsolvable', moves: '', expansions: expanded };
 }
 
+// --- room decomposition: split the level into balanced sub-levels and solve each -------------
+// Last resort after every whole-level search failed. Single-cell articulation squares (free,
+// boxless, goalless) are cut; the remaining components carry supply = boxes - goals; unbalanced
+// components greedily absorb neighbors across cut squares until balanced. Each balanced body
+// (a small independent sub-level with boxes == goals) is push-solved on its own grid, and the
+// pieces are stitched with plain player walks. The stitched string is replay-checked against
+// the real level before it is accepted. All budgets are expansion counts, so this stays
+// deterministic; totalCap bounds the work across all bodies.
+function decomposeSolve(lv: Level, totalCap: number): Outcome {
+  const { W, n, wall, goal, goals } = lv;
+  const H = Math.floor(n / W);
+  const DD = [-W, W, -1, 1];
+  const boxSet = new Set<number>(lv.boxes);
+  const goalSet = new Set<number>(goals);
+  const cellName = (c: number): string => `${c % W},${Math.floor(c / W)}`;
+
+  // articulation squares
+  const isCut = new Uint8Array(n);
+  for (let c = 0; c < n; c++) {
+    if (wall[c] || boxSet.has(c) || goalSet.has(c)) continue;
+    const seen = new Uint8Array(n);
+    let comps = 0;
+    for (let s = 0; s < n && comps < 2; s++) {
+      if (wall[s] || s === c || seen[s]) continue;
+      comps++;
+      const stack = [s];
+      seen[s] = 1;
+      while (stack.length > 0) {
+        const p = stack.pop()!;
+        for (const d of DD) {
+          const t = p + d;
+          if (t < 0 || t >= n || wall[t] || t === c || seen[t]) continue;
+          seen[t] = 1;
+          stack.push(t);
+        }
+      }
+    }
+    if (comps >= 2) isCut[c] = 1;
+  }
+
+  // components over free non-cut squares
+  const comp = new Int32Array(n).fill(-1);
+  const compCells: number[][] = [];
+  const compMin: number[] = [];
+  for (let s = 0; s < n; s++) {
+    if (wall[s] || isCut[s] || comp[s] !== -1) continue;
+    const id = compCells.length;
+    const cells: number[] = [];
+    const stack = [s];
+    comp[s] = id;
+    while (stack.length > 0) {
+      const p = stack.pop()!;
+      cells.push(p);
+      for (const d of DD) {
+        const t = p + d;
+        if (t < 0 || t >= n || wall[t] || isCut[t] || comp[t] !== -1) continue;
+        comp[t] = id;
+        stack.push(t);
+      }
+    }
+    cells.sort((a, b) => a - b);
+    compCells.push(cells);
+    compMin.push(cells[0]!);
+  }
+  const nc = compCells.length;
+  const supply = compCells.map((cells) => {
+    let v = 0;
+    for (const c of cells) v += (boxSet.has(c) ? 1 : 0) - (goalSet.has(c) ? 1 : 0);
+    return v;
+  });
+
+  // node graph: nodes are comps (0..nc-1) and cut squares (nc + square)
+  const nNode = nc + n;
+  const nodeMin = (nd: number): number => (nd < nc ? compMin[nd]! : nd - nc);
+  const adj: number[][] = Array.from({ length: nNode }, () => []);
+  const link = (a: number, b: number): void => {
+    adj[a]!.push(b);
+    adj[b]!.push(a);
+  };
+  for (let c = 0; c < n; c++) {
+    if (wall[c] || !isCut[c]) continue;
+    for (const d of DD) {
+      const t = c + d;
+      if (t < 0 || t >= n || wall[t]) continue;
+      if (isCut[t]) link(nc + c, nc + t);
+      else link(nc + c, comp[t]!);
+    }
+  }
+  for (const a of adj) a.sort((x, y) => nodeMin(x)! - nodeMin(y)!);
+
+  // merge closure: unbalanced comps absorb nearest comps (through absorbed cut squares)
+  const parent = new Int32Array(nNode).map((_, i) => i);
+  const find = (x: number): number => {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]]!;
+      x = parent[x];
+    }
+    return x;
+  };
+  const members = new Map<number, Set<number>>();
+  for (let i = 0; i < nNode; i++) members.set(i, new Set([i]));
+  const rootSupply = (root: number): number => {
+    let v = 0;
+    for (const nd of members.get(root)!) if (nd < nc) v += supply[nd]!;
+    return v;
+  };
+  const startList = compCells
+    .map((_, k) => k)
+    .filter((k) => supply[k] !== 0)
+    .sort((a, b) => compMin[a]! - compMin[b]!);
+  for (const start of startList) {
+    const root = find(start);
+    if (rootSupply(root) === 0) continue;
+    const seen = new Set<number>([root]);
+    let frontier = [root];
+    let done = false;
+    while (!done && frontier.length > 0) {
+      const next: number[] = [];
+      const hits: number[] = [];
+      for (const nd of frontier) {
+        for (const t of adj[nd]!) {
+          const rt = find(t);
+          if (seen.has(rt)) continue;
+          seen.add(rt);
+          if (rt >= nc) {
+            const a = find(start);
+            members.get(a)!.add(rt);
+            parent[rt] = a;
+            next.push(rt);
+          } else {
+            next.push(rt);
+            hits.push(rt);
+          }
+        }
+      }
+      next.sort((a, b) => nodeMin(a)! - nodeMin(b)!);
+      for (const hit of hits.sort((a, b) => nodeMin(a)! - nodeMin(b)!)) {
+        const a = find(start);
+        const b = find(hit);
+        if (a === b) continue;
+        for (const nd of members.get(b)!) {
+          members.get(a)!.add(nd);
+          parent[nd] = a;
+        }
+        members.delete(b);
+        if (rootSupply(find(start)) === 0) {
+          done = true;
+          break;
+        }
+      }
+      frontier = next;
+    }
+    if (!done) return { status: 'budget', moves: '', expansions: 0 };
+  }
+
+  // bodies: groups holding boxes; entry = min-index boundary cut square (the player's door)
+  type Body = { cells: number[]; boxes: number[]; goalCells: number[]; entry: number };
+  const bodies: Body[] = [];
+  const bodyCellSets: Set<number>[] = [];
+  for (const [, nodes] of members) {
+    const cells = new Set<number>();
+    const boxes: number[] = [];
+    const goalCells: number[] = [];
+    let hasComp = false;
+    for (const nd of nodes) {
+      if (nd >= nc && !isCut[nd - nc]) continue;
+      if (nd < nc) hasComp = true;
+      const cs = nd < nc ? compCells[nd]! : [nd - nc];
+      for (const c of cs) {
+        cells.add(c);
+        if (boxSet.has(c)) boxes.push(c);
+        if (goalSet.has(c)) goalCells.push(c);
+      }
+    }
+    if (!hasComp || boxes.length === 0) continue;
+    bodies.push({ cells: [...cells].sort((a, b) => a - b), boxes, goalCells, entry: -1 });
+    bodyCellSets.push(cells);
+  }
+  const cutList: number[] = [];
+  for (let c = 0; c < n; c++) if (isCut[c]) cutList.push(c);
+  for (let i = 0; i < bodies.length; i++) {
+    const b = bodies[i]!;
+    const cells = bodyCellSets[i]!;
+    for (const c of cutList) {
+      if (cells.has(c)) continue;
+      let touches = false;
+      for (const d of DD) {
+        const t = c + d;
+        if (t >= 0 && t < n && cells.has(t)) {
+          touches = true;
+          break;
+        }
+      }
+      if (!touches) continue;
+      // cut squares never hold boxes at the end of a solution (they are not goals), so a door
+      // may be shared by several bodies
+      b.entry = c;
+      cells.add(c);
+      b.cells = [...cells].sort((x, y) => x - y);
+      break;
+    }
+    if (b.entry === -1 && cells.has(lv.player)) b.entry = lv.player;
+    if (b.entry === -1) return { status: 'budget', moves: '', expansions: 0 };
+  }
+  bodies.sort((a, b) => a.cells[0]! - b.cells[0]!);
+
+  // solve each body on its own grid, walk between entries on the real grid
+  const subLevel = (cells: number[], boxes: number[], goalCells: number[], player: number): Level => {
+    const keep = new Set(cells);
+    const rows: string[] = [];
+    for (let y = 0; y < H; y++) {
+      let row = '';
+      for (let x = 0; x < W; x++) {
+        const c = y * W + x;
+        if (!keep.has(c)) row += '#';
+        else if (boxes.includes(c)) row += '$';
+        else if (goalCells.includes(c)) row += '.';
+        else if (c === player) row += '@';
+        else row += ' ';
+      }
+      rows.push(row);
+    }
+    return parse(rows.join('\n') + '\n');
+  };
+  const walk = (from: number, to: number, boxes: Set<number>): string | null => {
+    if (from === to) return '';
+    const par = new Int32Array(n).fill(-2);
+    par[from] = -1;
+    const q = [from];
+    for (let h = 0; h < q.length; h++) {
+      const p = q[h]!;
+      for (const d of DD) {
+        const t = p + d;
+        if (t < 0 || t >= n || wall[t] || boxes.has(t) || par[t] !== -2) continue;
+        par[t] = p;
+        if (t === to) {
+          let s = '';
+          for (let v = to; par[v] !== -1; v = par[v]!) {
+            const dd = v - par[v]!;
+            s = (dd === 1 ? 'r' : dd === -1 ? 'l' : dd === W ? 'd' : 'u') + s;
+          }
+          return s;
+        }
+        q.push(t);
+      }
+    }
+    return null;
+  };
+  let player = lv.player;
+  const boxNow = new Set<number>(lv.boxes);
+  const pieces: string[] = [];
+  let cap = totalCap;
+  let used = 0;
+  for (const b of bodies) {
+    const w = walk(player, b.entry, boxNow);
+    if (w === null) return { status: 'budget', moves: '', expansions: used };
+    const bcap = Math.min(cap, DECOMP_BODY_CAP);
+    if (bcap <= 0) return { status: 'budget', moves: '', expansions: used };
+    const sl = subLevel(b.cells, b.boxes, b.goalCells, b.entry);
+    const r = pushSolve(sl, bcap, 1);
+    cap -= r.expansions;
+    used += r.expansions;
+    if (r.status !== 'solved' || !replayOk(sl, r.moves)) {
+      return { status: r.status === 'unsolvable' ? 'unsolvable' : 'budget', moves: '', expansions: used };
+    }
+    pieces.push(w, r.moves);
+    let p = b.entry;
+    const sim = new Set<number>(b.boxes);
+    for (const ch of r.moves) {
+      const di = 'udlr'.indexOf(ch.toLowerCase());
+      const d = DD[di]!;
+      const t = p + d;
+      if (sim.has(t)) {
+        const t2 = t + d;
+        sim.delete(t);
+        sim.add(t2);
+      }
+      p = t;
+    }
+    player = p;
+    for (const bb of b.boxes) boxNow.delete(bb);
+    for (const bb of sim) boxNow.add(bb);
+  }
+  const moves = pieces.join('');
+  if (!replayOk(lv, moves)) return { status: 'budget', moves: '', expansions: used };
+  return { status: 'solved', moves, expansions: used };
+}
+
 // Independent replay check: every step must be legal, every box must end on a goal.
-function replayOk(lv: Level, moves: string): boolean {
+export function replayOk(lv: Level, moves: string): boolean {
   const { W, n, wall, goal } = lv;
   const dd = [DY[0]! * W + DX[0]!, DY[1]! * W + DX[1]!, DY[2]! * W + DX[2]!, DY[3]! * W + DX[3]!];
   const boxes = new Set<number>(lv.boxes);
@@ -1033,6 +1330,10 @@ function solveLevel(text: string): { moves: string; note: string } {
       if (mv.status === 'solved' && replayOk(lv, mv.moves)) {
         return { moves: mv.moves, note: `fallback move-A* x${mv.expansions}` };
       }
+      const dc = decomposeSolve(lv, DECOMP_TOTAL);
+      if (dc.status === 'solved' && replayOk(lv, dc.moves)) {
+        return { moves: dc.moves, note: `decomposed x${dc.expansions}` };
+      }
     }
     return { moves: '', note: `gave up (${opt.status})` };
   }
@@ -1056,6 +1357,10 @@ function solveLevel(text: string): { moves: string; note: string } {
       return { moves: mv.moves, note: `fallback move-A* x${mv.expansions}` };
     }
   }
+  const dc = decomposeSolve(lv, DECOMP_TOTAL);
+  if (dc.status === 'solved' && replayOk(lv, dc.moves)) {
+    return { moves: dc.moves, note: `decomposed x${dc.expansions}` };
+  }
   return { moves: '', note: `gave up (${fast.status})` };
 }
 
@@ -1065,16 +1370,18 @@ const countPushes = (m: string): number => {
   return c;
 };
 
-mkdirSync(OUT, { recursive: true });
-for (const id of readdirSync(IN).sort()) {
-  let text: string;
-  try {
-    text = readFileSync(join(IN, id, 'level.txt'), 'utf8');
-  } catch {
-    continue;
+if (pathToFileURL(process.argv[1]!).href === import.meta.url) {
+  mkdirSync(OUT, { recursive: true });
+  for (const id of readdirSync(IN).sort()) {
+    let text: string;
+    try {
+      text = readFileSync(join(IN, id, 'level.txt'), 'utf8');
+    } catch {
+      continue;
+    }
+    const { moves, note } = solveLevel(text);
+    mkdirSync(join(OUT, id), { recursive: true });
+    writeFileSync(join(OUT, id, 'solution.txt'), `${moves}\n`);
+    console.error(`${id}: ${note} pushes=${countPushes(moves)} moves=${moves.length}`);
   }
-  const { moves, note } = solveLevel(text);
-  mkdirSync(join(OUT, id), { recursive: true });
-  writeFileSync(join(OUT, id, 'solution.txt'), `${moves}\n`);
-  console.error(`${id}: ${note} pushes=${countPushes(moves)} moves=${moves.length}`);
 }
