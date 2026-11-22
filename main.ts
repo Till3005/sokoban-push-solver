@@ -18,19 +18,38 @@
 //   4. empty solution.txt as the last resort.
 // Every candidate solution is replay-checked internally before it is written.
 //
-// Determinism: budgets are node-expansion counts (never wall-clock), ids/boxes/goals are sorted,
-// heap tie-breaks are fixed (f, state key, node index), no Math.random / Date / network.
+// Levels with >= BIG_LEVEL_BOXES boxes try the cheap weighted pass first: the optimal pass is
+// the expensive one, so on big boards we only pay for it when the cheap passes fail.
+//
+// Bounded memory: A* nodes live in flat typed-array pools sized PUSH_POOL_NODES /
+// MOVE_POOL_NODES. When a pool fills, the search abandons immediately (status 'budget') instead
+// of growing — RSS is a deterministic function of the pool caps, never of the level. Push
+// directions are stored as one byte per node and player walk segments are rebuilt by BFS at
+// reconstruction time, so no per-node step strings are retained.
+//
+// Determinism: budgets are node-expansion/commit counts (never wall-clock), ids/boxes/goals are
+// sorted, heap tie-breaks are fixed (f, state key, node index), no Math.random / Date / network.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const IN = process.argv[2] ?? '/input';
 const OUT = process.argv[3] ?? '/output';
-const PUSH_EXPANSIONS = 250_000;
+const PUSH_EXPANSIONS = 250_000; // optimal pass, small levels (i003 solves at 179,204)
+const BIG_PUSH_EXPANSIONS = 32_000; // optimal pass, big levels: reduced so a give-up is cheap
 const PUSH_W_EXPANSIONS = 100_000;
+const BIG_W_EXPANSIONS = 50_000; // weighted pass on big levels: cheaper give-up
 const PUSH_WEIGHT = 3;
 const GREEDY_EXPANSIONS = 100_000;
 const MOVE_EXPANSIONS = 150_000;
+const BIG_LEVEL_BOXES = 10;
+// Node-pool ceilings. Push search: worst observed need is i003's 968,140 commits at 250k
+// expansions (worst commits/expansion rate seen is ~16, so a pool of min(ceiling, cap*16+1024)
+// never truncates a search that its expansion budget would have finished). Move search: at most
+// 4 children per expansion. Pools scale with the budget so memory stays proportional to the
+// work actually allowed; when a pool fills the search abandons gracefully (status 'budget').
+const PUSH_POOL_NODES = 1_200_000;
+const MOVE_POOL_NODES = 620_000;
 const BIG = 10_000_000;
 
 // deltas in row-major grid order: u, d, l, r
@@ -297,6 +316,7 @@ function pushSolve(lv: Level, cap: number, weight: number): Outcome {
   const rootBoxes = lv.boxes.slice();
   const rootPlayer = lv.player;
   const G = goals.length;
+  const B = rootBoxes.length;
   const DD = [DY[0]! * W + DX[0]!, DY[1]! * W + DX[1]!, DY[2]! * W + DX[2]!, DY[3]! * W + DX[3]!];
 
   const mk = (): Flood => ({
@@ -359,58 +379,163 @@ function pushSolve(lv: Level, cap: number, weight: number): Outcome {
     return matchingCost(mat, bs.length, G);
   };
 
-  const nKey: string[] = [];
-  const nPlayerA: number[] = [];
-  const nBoxes: number[][] = [];
-  const nG: number[] = [];
-  const nH: number[] = [];
-  const nParent: number[] = [];
-  const nStep: string[] = [];
-  const best = new Map<string, number>();
-  const heap: [number, number][] = [];
-  const less = (a: [number, number], b: [number, number]): boolean =>
-    a[0] < b[0] ||
-    (a[0] === b[0] && (nKey[a[1]]! < nKey[b[1]]! || (nKey[a[1]] === nKey[b[1]] && a[1] < b[1])));
-  const hpush = (e: [number, number]): void => {
-    let i = heap.length;
-    heap.push(e);
+  // Bounded node pools: fixed typed-array slots per node. Dedup uses an open-addressing table
+  // with EXACT key comparison (canonical player square + sorted boxes — a hash hit is always
+  // verified), so no per-node key strings or Map entries are ever allocated. Heap tie-breaks
+  // compare the same (canon, boxes) key element-wise. The pool size is derived from the
+  // expansion budget (never wall-clock); when it fills the search abandons (budget) — RSS never
+  // depends on how hard the level fights back.
+  const MAXN = Math.min(PUSH_POOL_NODES, cap * 16 + 1024);
+  const nBoxes = new Int32Array(MAXN * B);
+  const nCanon = new Int32Array(MAXN);
+  const nPlayerA = new Int32Array(MAXN);
+  const nG = new Int32Array(MAXN);
+  const nH = new Int32Array(MAXN);
+  const nParent = new Int32Array(MAXN);
+  const nDir = new Uint8Array(MAXN); // push direction 0..3; 4 = root
+  const heapF = new Int32Array(MAXN);
+  const heapI = new Int32Array(MAXN);
+  let heapLen = 0;
+  let cnt = 0;
+  const boxMark = new Uint8Array(n);
+  let TCAP = 1024;
+  while (TCAP < 2 * MAXN) TCAP <<= 1;
+  const table = new Int32Array(TCAP); // transposition table: node index + 1, 0 = empty
+  const TMASK = TCAP - 1;
+  const nodeHash = (t: number): number => {
+    let h = 0x811c9dc5 | 0;
+    h = Math.imul(h ^ nCanon[t]!, 16777619);
+    const off = t * B;
+    for (let i = 0; i < B; i++) h = Math.imul(h ^ nBoxes[off + i]!, 16777619);
+    return h >>> 0;
+  };
+  const nodeEq = (t1: number, t2: number): boolean => {
+    if (nCanon[t1] !== nCanon[t2]) return false;
+    const o1 = t1 * B;
+    const o2 = t2 * B;
+    for (let i = 0; i < B; i++) if (nBoxes[o1 + i] !== nBoxes[o2 + i]) return false;
+    return true;
+  };
+  const candEq = (t: number, canon: number, bs: number[]): boolean => {
+    if (nCanon[t] !== canon) return false;
+    const off = t * B;
+    for (let i = 0; i < B; i++) if (nBoxes[off + i] !== bs[i]) return false;
+    return true;
+  };
+  const tableFindNode = (t: number): number => {
+    let slot = nodeHash(t) & TMASK;
+    for (;;) {
+      const v = table[slot]!;
+      if (v === 0) return -1;
+      if (nodeEq(v - 1, t)) return v - 1;
+      slot = (slot + 1) & TMASK;
+    }
+  };
+  const tableFindCand = (canon: number, bs: number[]): number => {
+    let h = 0x811c9dc5 | 0;
+    h = Math.imul(h ^ canon, 16777619);
+    for (let i = 0; i < B; i++) h = Math.imul(h ^ bs[i]!, 16777619);
+    let slot = (h >>> 0) & TMASK;
+    for (;;) {
+      const v = table[slot]!;
+      if (v === 0) return -1;
+      if (candEq(v - 1, canon, bs)) return v - 1;
+      slot = (slot + 1) & TMASK;
+    }
+  };
+  const tableSet = (t: number): void => {
+    let slot = nodeHash(t) & TMASK;
+    for (;;) {
+      const v = table[slot]!;
+      if (v === 0 || nodeEq(v - 1, t)) {
+        table[slot] = t + 1;
+        return;
+      }
+      slot = (slot + 1) & TMASK;
+    }
+  };
+  const keyLess = (t1: number, t2: number): boolean => {
+    // same total order as the previous fromCharCode string keys: canon first, then boxes
+    if (nCanon[t1] !== nCanon[t2]) return nCanon[t1]! < nCanon[t2]!;
+    const o1 = t1 * B;
+    const o2 = t2 * B;
+    for (let i = 0; i < B; i++) {
+      const x = nBoxes[o1 + i]!;
+      const y = nBoxes[o2 + i]!;
+      if (x !== y) return x < y;
+    }
+    return false;
+  };
+  const less = (a: number, b: number): boolean => {
+    if (heapF[a]! !== heapF[b]!) return heapF[a]! < heapF[b]!;
+    const ia = heapI[a]!;
+    const ib = heapI[b]!;
+    if (keyLess(ia, ib)) return true;
+    if (keyLess(ib, ia)) return false;
+    return ia < ib;
+  };
+  const hswap = (a: number, b: number): void => {
+    const f = heapF[a]!;
+    const i = heapI[a]!;
+    heapF[a] = heapF[b]!;
+    heapI[a] = heapI[b]!;
+    heapF[b] = f;
+    heapI[b] = i;
+  };
+  const hpush = (i: number): void => {
     while (i > 0) {
       const p = (i - 1) >> 1;
-      if (!less(heap[i]!, heap[p]!)) break;
-      [heap[i], heap[p]] = [heap[p]!, heap[i]!];
+      if (!less(i, p)) break;
+      hswap(i, p);
       i = p;
     }
   };
-  const hpop = (): [number, number] => {
-    const top = heap[0]!;
-    const last = heap.pop()!;
-    if (heap.length > 0) {
-      heap[0] = last;
+  const hpop = (): number => {
+    const top = heapI[0]!;
+    heapLen--;
+    if (heapLen > 0) {
+      heapF[0] = heapF[heapLen]!;
+      heapI[0] = heapI[heapLen]!;
       for (let i = 0; ; ) {
         let c = 2 * i + 1;
-        if (c >= heap.length) break;
-        if (c + 1 < heap.length && less(heap[c + 1]!, heap[c]!)) c++;
-        if (!less(heap[c]!, heap[i]!)) break;
-        [heap[i], heap[c]] = [heap[c]!, heap[i]!];
+        if (c >= heapLen) break;
+        if (c + 1 < heapLen && less(c + 1, c)) c++;
+        if (!less(c, i)) break;
+        hswap(i, c);
         i = c;
       }
     }
     return top;
   };
-  const commit = (key: string, playerA: number, bs: number[], g: number, h: number, parent: number, step: string): void => {
-    const t = nKey.length;
-    nKey.push(key);
-    nPlayerA.push(playerA);
-    nBoxes.push(bs);
-    nG.push(g);
-    nH.push(h);
-    nParent.push(parent);
-    nStep.push(step);
-    best.set(key, t);
-    hpush([g + weight * h, t]);
+  const commit = (
+    canon: number,
+    playerA: number,
+    bs: number[],
+    g: number,
+    h: number,
+    parent: number,
+    dir: number,
+  ): boolean => {
+    if (cnt >= MAXN) return false; // pool full: abandon
+    const t = cnt++;
+    nCanon[t] = canon;
+    const off = t * B;
+    for (let i = 0; i < B; i++) nBoxes[off + i] = bs[i]!;
+    nPlayerA[t] = playerA;
+    nG[t] = g;
+    nH[t] = h;
+    nParent[t] = parent;
+    nDir[t] = dir;
+    tableSet(t);
+    heapF[heapLen] = g + weight * h;
+    heapI[heapLen] = t;
+    heapLen++;
+    hpush(heapLen - 1);
+    return true;
   };
 
-  const scratch: number[] = new Array(40).fill(0);
+  const scratch: number[] = new Array(Math.max(1, B)).fill(0);
+  const walkBoxes: number[] = new Array(Math.max(1, B)).fill(0);
   if (rootBoxes.length > G || rootBoxes.some((b) => minDist[b] === Infinity)) {
     return { status: 'unsolvable', moves: '', expansions: 0 };
   }
@@ -419,47 +544,63 @@ function pushSolve(lv: Level, cap: number, weight: number): Outcome {
   {
     const h0 = hOf(rootBoxes, rootPlayer);
     if (h0 >= BIG) return { status: 'unsolvable', moves: '', expansions: 0 };
-    commit(String.fromCharCode(rootCanon, ...rootBoxes), rootPlayer, rootBoxes, 0, h0, -1, '');
+    if (!commit(rootCanon, rootPlayer, rootBoxes, 0, h0, -1, 4)) {
+      return { status: 'budget', moves: '', expansions: 0 };
+    }
   }
   let expanded = 0;
-  while (heap.length > 0) {
-    const [, s] = hpop();
-    if (best.get(nKey[s]!) !== s) continue;
+  while (heapLen > 0) {
+    const s = hpop();
+    if (tableFindNode(s) !== s) continue;
     if (nH[s] === 0) {
+      // Rebuild each node's player walk with a fresh BFS over the parent state — deterministic
+      // and identical to the flood the expansion originally ran.
       let m = '';
-      for (let t = s; t > 0; t = nParent[t]!) m = nStep[t]! + m;
+      for (let t = s; t > 0; t = nParent[t]!) {
+        const di = nDir[t]!;
+        const p = nParent[t]!;
+        const off = p * B;
+        for (let i = 0; i < B; i++) walkBoxes[i] = nBoxes[off + i]!;
+        flood(pa, nPlayerA[p]!, walkBoxes);
+        const from = nPlayerA[t]! - DD[di]!;
+        m = walkTo(pa, from) + CHU[di]! + m;
+      }
       return { status: 'solved', moves: m, expansions: expanded };
     }
     if (expanded >= cap) return { status: 'budget', moves: '', expansions: expanded };
     expanded++;
-    const boxes = nBoxes[s]!;
-    const B = boxes.length;
+    const sOff = s * B;
     const g1 = nG[s]! + 1;
-    flood(pa, nPlayerA[s]!, boxes);
+    for (let i = 0; i < B; i++) {
+      walkBoxes[i] = nBoxes[sOff + i]!;
+      boxMark[walkBoxes[i]!] = 1;
+    }
+    flood(pa, nPlayerA[s]!, walkBoxes);
     const pStamp = pa.stamp;
     const pCur = pa.cur;
     for (let bi = 0; bi < B; bi++) {
-      const b = boxes[bi]!;
+      const b = nBoxes[sOff + bi]!;
       for (let di = 0; di < 4; di++) {
         const d = DD[di]!;
         const from = b - d;
         const to = b + d;
         if (wall[from] !== 0 || pStamp[from] !== pCur) continue;
-        if (wall[to] !== 0 || boxes.indexOf(to) >= 0 || dead[to]) continue;
-        scratch.length = B;
-        for (let i = 0; i < B; i++) scratch[i] = boxes[i]!;
+        if (wall[to] !== 0 || boxMark[to] !== 0 || dead[to]) continue;
+        for (let i = 0; i < B; i++) scratch[i] = nBoxes[sOff + i]!;
         scratch[bi] = to;
         scratch.sort((x, y) => x - y);
         if (frozenDeadlock(wall, goal, dead, W, scratch, to)) continue;
         const childCanon = flood(ca, b, scratch);
-        const key = String.fromCharCode(childCanon, ...scratch);
-        const old = best.get(key);
-        if (old !== undefined && nG[old]! <= g1) continue;
+        const old = tableFindCand(childCanon, scratch);
+        if (old !== -1 && nG[old]! <= g1) continue;
         const h = hOf(scratch, b);
         if (h >= BIG) continue; // some box can reach no goal from here: unsolvable configuration
-        commit(key, b, scratch.slice(), g1, h, s, walkTo(pa, from) + CHU[di]);
+        if (!commit(childCanon, b, scratch, g1, h, s, di)) {
+          return { status: 'budget', moves: '', expansions: expanded };
+        }
       }
     }
+    for (let i = 0; i < B; i++) boxMark[nBoxes[sOff + i]!] = 0;
   }
   return { status: 'unsolvable', moves: '', expansions: expanded };
 }
@@ -619,92 +760,231 @@ function greedySolve(lv: Level, cap: number): Outcome {
 
 // Plain move-level A* (kit baseline port, plus dead-square/freeze pruning): every step costs 1.
 
-// Valid solutions, not always push-optimal. Last solver in the chain.
+// Valid solutions, not always push-optimal. Last solver in the chain. Node storage is a flat
+// typed-array pool with a hard cap: abandon (budget) when full, so memory never grows unbounded.
 function moveSolve(lv: Level, cap: number): Outcome {
   const { W, n, wall, goal, goals, dead, player } = lv;
   const DD = [DY[0]! * W + DX[0]!, DY[1]! * W + DX[1]!, DY[2]! * W + DX[2]!, DY[3]! * W + DX[3]!];
+  const B = lv.boxes.length;
   const goalsSorted = goals.slice().sort((a, b) => a - b);
   const manh = (a: number, b: number): number =>
     Math.abs((a % W) - (b % W)) + Math.abs(Math.floor(a / W) - Math.floor(b / W));
-  const dist = (b: number): number => Math.min(...goalsSorted.map((g) => manh(g, b)));
-  const est = (bs: number[]): number => bs.reduce((a, b) => a + dist(b), 0);
-  const key = (p: number, bs: number[]): string => String.fromCharCode(p, ...bs);
-  const sp: number[] = [player];
-  const sb: number[][] = [lv.boxes.slice()];
-  const sg: number[] = [0];
-  const parent: number[] = [-1];
-  const step: string[] = [''];
-  const best = new Map<string, number>([[key(player, sb[0]!), 0]]);
-  const heap: [number, number, number][] = [[est(sb[0]!), 0, 0]];
-  const less = (a: [number, number, number], b: [number, number, number]): boolean =>
-    a[0] < b[0] || (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] < b[2])));
-  const hpush = (e: [number, number, number]): void => {
-    let i = heap.length;
-    heap.push(e);
+  const goalDist = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    let m = Infinity;
+    for (const g of goalsSorted) {
+      const d = manh(g, i);
+      if (d < m) m = d;
+    }
+    goalDist[i] = m;
+  }
+  const est = (bs: number[]): number => {
+    let a = 0;
+    for (let i = 0; i < bs.length; i++) a += goalDist[bs[i]!]!;
+    return a;
+  };
+  const MAXN = Math.min(MOVE_POOL_NODES, cap * 4 + 1024);
+  const sp = new Int32Array(MAXN);
+  const sb = new Int32Array(MAXN * B);
+  const sg = new Int32Array(MAXN);
+  const sh = new Int32Array(MAXN);
+  const parent = new Int32Array(MAXN);
+  const stepDi = new Uint8Array(MAXN); // 0..3 walk, 4..7 push (di + 4)
+  const heapF = new Int32Array(MAXN);
+  const heapG = new Int32Array(MAXN);
+  const heapI = new Int32Array(MAXN);
+  let heapLen = 0;
+  let cnt = 0;
+  // Transposition table: open addressing, exact key compare (player square + sorted boxes),
+  // no per-node strings. Entries are node index + 1; 0 = empty.
+  let TCAP = 1024;
+  while (TCAP < 2 * MAXN) TCAP <<= 1;
+  const table = new Int32Array(TCAP);
+  const TMASK = TCAP - 1;
+  const nodeHash = (t: number): number => {
+    let h = 0x811c9dc5 | 0;
+    h = Math.imul(h ^ sp[t]!, 16777619);
+    const off = t * B;
+    for (let i = 0; i < B; i++) h = Math.imul(h ^ sb[off + i]!, 16777619);
+    return h >>> 0;
+  };
+  const nodeEq = (t1: number, t2: number): boolean => {
+    if (sp[t1] !== sp[t2]) return false;
+    const o1 = t1 * B;
+    const o2 = t2 * B;
+    for (let i = 0; i < B; i++) if (sb[o1 + i] !== sb[o2 + i]) return false;
+    return true;
+  };
+  const candEq = (t: number, p: number, bs: number[]): boolean => {
+    if (sp[t] !== p) return false;
+    const off = t * B;
+    for (let i = 0; i < B; i++) if (sb[off + i] !== bs[i]) return false;
+    return true;
+  };
+  const tableFindNode = (t: number): number => {
+    let slot = nodeHash(t) & TMASK;
+    for (;;) {
+      const v = table[slot]!;
+      if (v === 0) return -1;
+      if (nodeEq(v - 1, t)) return v - 1;
+      slot = (slot + 1) & TMASK;
+    }
+  };
+  const tableFindCand = (p: number, bs: number[]): number => {
+    let h = 0x811c9dc5 | 0;
+    h = Math.imul(h ^ p, 16777619);
+    for (let i = 0; i < B; i++) h = Math.imul(h ^ bs[i]!, 16777619);
+    let slot = (h >>> 0) & TMASK;
+    for (;;) {
+      const v = table[slot]!;
+      if (v === 0) return -1;
+      if (candEq(v - 1, p, bs)) return v - 1;
+      slot = (slot + 1) & TMASK;
+    }
+  };
+  const tableSet = (t: number): void => {
+    let slot = nodeHash(t) & TMASK;
+    for (;;) {
+      const v = table[slot]!;
+      if (v === 0 || nodeEq(v - 1, t)) {
+        table[slot] = t + 1;
+        return;
+      }
+      slot = (slot + 1) & TMASK;
+    }
+  };
+  const less = (a: number, b: number): boolean => {
+    if (heapF[a]! !== heapF[b]!) return heapF[a]! < heapF[b]!;
+    if (heapG[a]! !== heapG[b]!) return heapG[a]! > heapG[b]!;
+    return heapI[a]! < heapI[b]!;
+  };
+  const hswap = (a: number, b: number): void => {
+    let v = heapF[a]!;
+    heapF[a] = heapF[b]!;
+    heapF[b] = v;
+    v = heapG[a]!;
+    heapG[a] = heapG[b]!;
+    heapG[b] = v;
+    v = heapI[a]!;
+    heapI[a] = heapI[b]!;
+    heapI[b] = v;
+  };
+  const hpush = (i: number): void => {
     while (i > 0) {
       const p = (i - 1) >> 1;
-      if (!less(heap[i]!, heap[p]!)) break;
-      [heap[i], heap[p]] = [heap[p]!, heap[i]!];
+      if (!less(i, p)) break;
+      hswap(i, p);
       i = p;
     }
   };
-  const hpop = (): [number, number, number] => {
-    const top = heap[0]!;
-    const last = heap.pop()!;
-    if (heap.length > 0) {
-      heap[0] = last;
+  const hpop = (): number => {
+    const top = heapI[0]!;
+    heapLen--;
+    if (heapLen > 0) {
+      heapF[0] = heapF[heapLen]!;
+      heapG[0] = heapG[heapLen]!;
+      heapI[0] = heapI[heapLen]!;
       for (let i = 0; ; ) {
         let c = 2 * i + 1;
-        if (c >= heap.length) break;
-        if (c + 1 < heap.length && less(heap[c + 1]!, heap[c]!)) c++;
-        if (!less(heap[c]!, heap[i]!)) break;
-        [heap[i], heap[c]] = [heap[c]!, heap[i]!];
+        if (c >= heapLen) break;
+        if (c + 1 < heapLen && less(c + 1, c)) c++;
+        if (!less(c, i)) break;
+        hswap(i, c);
         i = c;
       }
     }
     return top;
   };
+  // root
+  sp[0] = player;
+  const rootBoxes = lv.boxes;
+  for (let i = 0; i < B; i++) sb[i] = rootBoxes[i]!;
+  sg[0] = 0;
+  sh[0] = est(rootBoxes);
+  parent[0] = -1;
+  stepDi[0] = 8; // unused sentinel
+  cnt = 1;
+  tableSet(0);
+  heapF[0] = sh[0]!;
+  heapG[0] = 0;
+  heapI[0] = 0;
+  heapLen = 1;
+  const scratch: number[] = new Array(Math.max(1, B)).fill(0);
+  const curBoxes: number[] = new Array(Math.max(1, B)).fill(0);
+  const boxMark = new Uint8Array(n);
   let expanded = 0;
-  while (heap.length > 0) {
-    const [, g, s] = hpop();
-    if (best.get(key(sp[s]!, sb[s]!)) !== s) continue;
-    const bs = sb[s]!;
-    if (bs.every((b) => goal[b])) {
+  while (heapLen > 0) {
+    const s = hpop();
+    if (tableFindNode(s) !== s) continue;
+    const sOff = s * B;
+    let all = true;
+    for (let i = 0; i < B; i++) {
+      if (!goal[sb[sOff + i]!]) {
+        all = false;
+        break;
+      }
+    }
+    if (all) {
       let moves = '';
-      for (let t = s; t > 0; t = parent[t]!) moves = step[t]! + moves;
+      for (let t = s; t > 0; t = parent[t]!) {
+        const v = stepDi[t]!;
+        moves = (v < 4 ? CH[v]! : CHU[v - 4]!) + moves;
+      }
       return { status: 'solved', moves, expansions: expanded };
     }
     if (expanded >= cap) return { status: 'budget', moves: '', expansions: expanded };
     expanded++;
     const p = sp[s]!;
+    const g = sg[s]!;
+    for (let i = 0; i < B; i++) {
+      curBoxes[i] = sb[sOff + i]!;
+      boxMark[curBoxes[i]!] = 1;
+    }
     for (let di = 0; di < 4; di++) {
       const d = DD[di]!;
       const q = p + d;
       if (q < 0 || q >= n || wall[q]) continue;
-      let nb = bs;
-      let move = CH[di]!;
-      const at = bs.indexOf(q);
+      const at = (() => {
+        for (let i = 0; i < B; i++) if (sb[sOff + i] === q) return i;
+        return -1;
+      })();
+      let pushed = false;
+      let childEst = sh[s]!;
+      let childBoxes: number[] | null = null;
       if (at >= 0) {
         const t2 = q + d;
-        if (t2 < 0 || t2 >= n || wall[t2] || bs.includes(t2) || dead[t2]) continue;
-        nb = bs.slice();
-        nb[at] = t2;
-        nb.sort((a, b) => a - b);
-        if (frozenDeadlock(wall, goal, dead, W, nb, t2)) continue;
-        move = CHU[di]!;
+        if (t2 < 0 || t2 >= n || wall[t2] || boxMark[t2] !== 0 || dead[t2]) continue;
+        for (let i = 0; i < B; i++) scratch[i] = sb[sOff + i]!;
+        scratch[at] = t2;
+        scratch.sort((x, y) => x - y);
+        if (frozenDeadlock(wall, goal, dead, W, scratch, t2)) continue;
+        pushed = true;
+        childEst = est(scratch);
+        childBoxes = scratch;
       }
-      const k = key(q, nb);
-      const seen = best.get(k);
-      if (seen !== undefined && sg[seen]! <= g + 1) continue;
-      const t = sp.length;
-      sp.push(q);
-      sb.push(nb);
-      sg.push(g + 1);
-      parent.push(s);
-      step.push(move);
-      best.set(k, t);
-      hpush([g + 1 + est(nb), g + 1, t]);
+      const seen = tableFindCand(q, childBoxes ?? curBoxes);
+      if (seen !== -1 && sg[seen]! <= g + 1) continue;
+      if (cnt >= MAXN) return { status: 'budget', moves: '', expansions: expanded };
+      const t = cnt++;
+      sp[t] = q;
+      const tOff = t * B;
+      if (childBoxes !== null) {
+        for (let i = 0; i < B; i++) sb[tOff + i] = childBoxes[i]!;
+      } else {
+        for (let i = 0; i < B; i++) sb[tOff + i] = sb[sOff + i]!;
+      }
+      sg[t] = g + 1;
+      sh[t] = childEst;
+      parent[t] = s;
+      stepDi[t] = di + (pushed ? 4 : 0);
+      tableSet(t);
+      heapF[heapLen] = g + 1 + childEst;
+      heapG[heapLen] = g + 1;
+      heapI[heapLen] = t;
+      heapLen++;
+      hpush(heapLen - 1);
     }
+    for (let i = 0; i < B; i++) boxMark[sb[sOff + i]!] = 0;
   }
   return { status: 'unsolvable', moves: '', expansions: expanded };
 }
@@ -734,14 +1014,38 @@ function replayOk(lv: Level, moves: string): boolean {
 
 function solveLevel(text: string): { moves: string; note: string } {
   const lv = parse(text);
-  const opt = pushSolve(lv, PUSH_EXPANSIONS, 1);
-  if (opt.status === 'solved' && replayOk(lv, opt.moves)) {
-    return { moves: opt.moves, note: `push-A* x${opt.expansions}` };
+  const big = lv.boxes.length >= BIG_LEVEL_BOXES;
+  if (!big) {
+    const opt = pushSolve(lv, PUSH_EXPANSIONS, 1);
+    if (opt.status === 'solved' && replayOk(lv, opt.moves)) {
+      return { moves: opt.moves, note: `push-A* x${opt.expansions}` };
+    }
+    if (opt.status !== 'unsolvable') {
+      const fast = pushSolve(lv, PUSH_W_EXPANSIONS, PUSH_WEIGHT);
+      if (fast.status === 'solved' && replayOk(lv, fast.moves)) {
+        return { moves: fast.moves, note: `push-A* w${PUSH_WEIGHT} x${fast.expansions}` };
+      }
+      const gr = greedySolve(lv, GREEDY_EXPANSIONS);
+      if (gr.status === 'solved' && replayOk(lv, gr.moves)) {
+        return { moves: gr.moves, note: `greedy x${gr.expansions}` };
+      }
+      const mv = moveSolve(lv, MOVE_EXPANSIONS);
+      if (mv.status === 'solved' && replayOk(lv, mv.moves)) {
+        return { moves: mv.moves, note: `fallback move-A* x${mv.expansions}` };
+      }
+    }
+    return { moves: '', note: `gave up (${opt.status})` };
   }
-  if (opt.status !== 'unsolvable') {
-    const fast = pushSolve(lv, PUSH_W_EXPANSIONS, PUSH_WEIGHT);
-    if (fast.status === 'solved' && replayOk(lv, fast.moves)) {
-      return { moves: fast.moves, note: `push-A* w${PUSH_WEIGHT} x${fast.expansions}` };
+  // Big board: the cheap weighted pass usually decides (i004 solves in 53 expansions), so run it
+  // first; the optimal pass gets only a reduced budget, and the move-level fallback stays last.
+  const fast = pushSolve(lv, BIG_W_EXPANSIONS, PUSH_WEIGHT);
+  if (fast.status === 'solved' && replayOk(lv, fast.moves)) {
+    return { moves: fast.moves, note: `push-A* w${PUSH_WEIGHT} x${fast.expansions}` };
+  }
+  if (fast.status !== 'unsolvable') {
+    const opt = pushSolve(lv, BIG_PUSH_EXPANSIONS, 1);
+    if (opt.status === 'solved' && replayOk(lv, opt.moves)) {
+      return { moves: opt.moves, note: `push-A* x${opt.expansions}` };
     }
     const gr = greedySolve(lv, GREEDY_EXPANSIONS);
     if (gr.status === 'solved' && replayOk(lv, gr.moves)) {
@@ -752,7 +1056,7 @@ function solveLevel(text: string): { moves: string; note: string } {
       return { moves: mv.moves, note: `fallback move-A* x${mv.expansions}` };
     }
   }
-  return { moves: '', note: `gave up (${opt.status})` };
+  return { moves: '', note: `gave up (${fast.status})` };
 }
 
 const countPushes = (m: string): number => {
